@@ -15,8 +15,6 @@ from aiogram.types import (
     CallbackQuery, Message, InlineKeyboardMarkup,
     ReplyKeyboardMarkup, KeyboardButton, BotCommand
 )
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
-import pytz
 
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -209,7 +207,7 @@ class Database:
         return dict(row) if row else None
     
     def get_members(self, gid):
-        self.cursor.execute("SELECT user_id,first_name,level,gang_rank FROM users WHERE gang_id=? ORDER BY CASE gang_rank WHEN 'leader' THEN 1 WHEN 'vice' THEN 2 ELSE 3 END", (gid,))
+        self.cursor.execute("SELECT user_id,first_name,level,gang_rank FROM users WHERE gang_id=?", (gid,))
         return [dict(r) for r in self.cursor.fetchall()]
     
     def leave_gang(self, user_id):
@@ -226,7 +224,7 @@ class Database:
 
 db = Database()
 
-# ==================== КЛАВИАТУРЫ ====================
+# ==================== КЛАВИАТУРА ====================
 def main_menu():
     builder = ReplyKeyboardBuilder()
     builder.row(KeyboardButton(text="💼 РАБОТА"), KeyboardButton(text="🎰 КАЗИНО"))
@@ -237,20 +235,14 @@ def main_menu():
     builder.row(KeyboardButton(text="🏆 ТОП"), KeyboardButton(text="❓ ПОМОЩЬ"))
     return builder.as_markup(resize_keyboard=True)
 
-def back_button():
-    builder = InlineKeyboardBuilder()
-    builder.button(text="🔙 Назад", callback_data="back")
-    return builder.as_markup()
-
 # ==================== БОТ ====================
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
-router = Router()
-dp.include_router(router)
 
-# ==================== /start ====================
-@router.message(Command("start"))
+# ==================== КОМАНДЫ (РЕГИСТРИРУЕМ ПЕРВЫМИ) ====================
+@dp.message(Command("start"))
 async def start(message: Message, command: CommandObject = None):
+    print(f"DEBUG: /start from {message.from_user.id}")  # Для отладки
     uid = message.from_user.id
     name = message.from_user.first_name or "Игрок"
     uname = message.from_user.username or "Player"
@@ -268,85 +260,376 @@ async def start(message: Message, command: CommandObject = None):
     
     await message.answer(text, reply_markup=main_menu(), parse_mode="Markdown")
 
-# ==================== КНОПКИ ГЛАВНОГО МЕНЮ ====================
+@dp.message(Command("help"))
+async def help_cmd(message: Message):
+    await message.answer(
+        "📚 *Помощь*\n\n"
+        "💼 РАБОТА — заработок\n"
+        "🎰 КАЗИНО — игры\n"
+        "🛒 МАГАЗИН — товары\n"
+        "🏠 ДОМ — недвижимость\n"
+        "🗺 ГОРОД — локации\n"
+        "🎒 ИНВЕНТАРЬ — вещи\n"
+        "🏴 БАНДА — банды\n"
+        "🕵️ КРИМИНАЛ — преступления\n"
+        "📊 СТАТУС — показатели\n"
+        "🗺 КАРТА — города\n"
+        "🏆 ТОП — рейтинг",
+        parse_mode="Markdown"
+    )
 
-@router.message(F.text == "💼 РАБОТА")
+@dp.message(Command("profile"))
+async def profile(message: Message):
+    u = db.get_user(message.from_user.id)
+    if not u: 
+        return await message.answer("❌ Сначала /start!")
+    city = CITIES.get(u['current_city'], CITIES['newark'])
+    g = db.get_gang(u['gang_id']) if u['gang_id'] else None
+    
+    await message.answer(
+        f"👤 *{u['first_name']}*\n"
+        f"📍 {city.emoji} {city.name}\n"
+        f"💰 ${u['money']} ⭐ Ур.{u['level']}\n"
+        f"🏴 {g['gang_name'] if g else 'Нет'}\n"
+        f"🗡 {u['weapon']} 🕵️ {u['crimes']} прест.",
+        parse_mode="Markdown"
+    )
+
+@dp.message(Command("gang_create"))
+async def gang_create(message: Message):
+    args = message.text.split()
+    if len(args) < 2: 
+        return await message.answer("❌ /gang_create [имя] [тег]")
+    
+    u = db.get_user(message.from_user.id)
+    if not u:
+        return await message.answer("❌ Сначала /start!")
+    if u['money'] < 1000: 
+        return await message.answer("❌ $1000 нужно!")
+    if u['gang_id']: 
+        return await message.answer("❌ Ты уже в банде!")
+    
+    name = args[1]
+    tag = args[2] if len(args) > 2 else name[:4].upper()
+    
+    gid = db.create_gang(name, tag, message.from_user.id)
+    if gid:
+        db.add_money(u['user_id'], -1000)
+        await message.answer(f"✅ Банда *{name}* [{tag}] создана!", parse_mode="Markdown")
+    else:
+        await message.answer("❌ Имя или тег заняты!")
+
+@dp.message(Command("rob"))
+async def rob_player(message: Message):
+    args = message.text.split()
+    if len(args) < 2: 
+        return await message.answer("❌ /rob [ID игрока]")
+    
+    try:
+        vid = int(args[1])
+    except:
+        return await message.answer("❌ Неверный ID!")
+    
+    if vid == message.from_user.id: 
+        return await message.answer("❌ Нельзя себя!")
+    
+    victim = db.get_user(vid)
+    if not victim: 
+        return await message.answer("❌ Игрок не найден!")
+    if victim['money'] < 50: 
+        return await message.answer("❌ У жертвы < $50!")
+    
+    u = db.get_user(message.from_user.id)
+    wd = WEAPONS.get(u['weapon'], {"damage": 5})['damage']
+    vd = WEAPONS.get(victim['weapon'], {"damage": 5})['damage']
+    chance = max(0.1, min(0.9, 0.3 + wd*0.01 - vd*0.005))
+    
+    if random.random() < chance:
+        stolen = int(victim['money'] * random.uniform(0.1, 0.3))
+        db.add_money(vid, -stolen)
+        db.add_money(u['user_id'], stolen)
+        db.update(u['user_id'], crimes=u['crimes']+1, stolen=u['stolen']+stolen)
+        await message.answer(f"✅ +${stolen}!")
+    else:
+        fine = random.randint(50, 200)
+        db.add_money(u['user_id'], -fine)
+        await message.answer(f"🚔 Штраф: ${fine}")
+
+@dp.message(Command("ref"))
+async def ref_cmd(message: Message):
+    u = db.get_user(message.from_user.id)
+    if not u: 
+        return await message.answer("❌ Сначала /start!")
+    bi = await bot.get_me()
+    link = f"https://t.me/{bi.username}?start={u['referral_code']}"
+    await message.answer(f"👥 *Рефералы*\n🔗 `{link}`\n📊 {u['total_referrals']} чел.", parse_mode="Markdown")
+
+# ==================== КНОПКИ МЕНЮ (ТЕКСТОВЫЕ) ====================
+@dp.message(F.text == "💼 РАБОТА")
 async def work_btn(message: Message):
-    user = db.get_user(message.from_user.id)
-    if not user:
-        return await message.answer("❌ /start сначала!")
+    u = db.get_user(message.from_user.id)
+    if not u:
+        return await message.answer("❌ Сначала /start!")
     
     builder = InlineKeyboardBuilder()
     jobs = [("📦 Курьер", 30), ("🍽 Официант", 45), ("💂 Охранник", 60), ("👔 Менеджер", 80), ("💻 Разработчик", 120)]
     for name, pay in jobs:
         builder.button(text=f"{name} (+${pay})", callback_data=f"work_{pay}")
-    builder.button(text="🔙 Назад", callback_data="back")
+    builder.button(text="🔙 Закрыть", callback_data="close")
     builder.adjust(1)
     
     await message.answer("💼 *Выбери работу:*", reply_markup=builder.as_markup(), parse_mode="Markdown")
 
-@router.callback_query(lambda c: c.data.startswith("work_"))
-async def do_work(callback: CallbackQuery):
-    user = db.get_user(callback.from_user.id)
-    pay = int(callback.data.split("_")[1])
-    
-    if user['energy'] < 20:
-        return await callback.answer("❌ Мало энергии!", show_alert=True)
-    
-    if user['last_work']:
-        last = datetime.fromisoformat(user['last_work'])
-        if (datetime.now() - last).seconds < 900:
-            return await callback.answer("⏳ Подожди 15 минут!", show_alert=True)
-    
-    city = CITIES.get(user['current_city'], CITIES['newark'])
-    total = int(pay * city.income_mult)
-    
-    db.add_money(user['user_id'], total)
-    db.update(user['user_id'], last_work=datetime.now().isoformat(), energy=user['energy']-20, xp=user['xp']+10)
-    
-    await callback.message.edit_text(f"✅ *Работа выполнена!*\n💰 +${total}", parse_mode="Markdown")
-
-@router.message(F.text == "🎰 КАЗИНО")
+@dp.message(F.text == "🎰 КАЗИНО")
 async def casino_btn(message: Message):
+    u = db.get_user(message.from_user.id)
+    if not u:
+        return await message.answer("❌ Сначала /start!")
+    
     builder = InlineKeyboardBuilder()
     builder.button(text="🎲 Рулетка ($50)", callback_data="casino_roulette")
     builder.button(text="🎰 Слоты ($10)", callback_data="casino_slots")
-    builder.button(text="🔙 Назад", callback_data="back")
+    builder.button(text="🔙 Закрыть", callback_data="close")
     builder.adjust(2)
     await message.answer("🎰 *Казино*", reply_markup=builder.as_markup(), parse_mode="Markdown")
 
-@router.callback_query(lambda c: c.data == "casino_roulette")
-async def roulette(callback: CallbackQuery):
-    u = db.get_user(callback.from_user.id)
-    if u['money'] < 50: return await callback.answer("❌ $50 нужно!", show_alert=True)
-    win = random.random() < 0.4
-    w = random.choice([100, 200, 500]) if win else -50
-    db.update(callback.from_user.id, money=u['money']+w)
-    await callback.message.edit_text(f"🎲 {'Выигрыш' if win else 'Проигрыш'}: ${abs(w)}\n💰 ${u['money']+w}", parse_mode="Markdown")
-
-@router.callback_query(lambda c: c.data == "casino_slots")
-async def slots(callback: CallbackQuery):
-    u = db.get_user(callback.from_user.id)
-    if u['money'] < 10: return await callback.answer("❌ $10 нужно!", show_alert=True)
-    s = ["🍒","🍋","🍊","⭐","💎","7️⃣"]
-    r = [random.choice(s) for _ in range(3)]
-    if r[0]==r[1]==r[2]: win, txt = 100, "ДЖЕКПОТ! +$100"
-    elif len(set(r))==2: win, txt = 20, "Повезло! +$20"
-    else: win, txt = -10, "Мимо! -$10"
-    db.update(callback.from_user.id, money=u['money']+win)
-    await callback.message.edit_text(f"🎰 [{'|'.join(r)}]\n{txt}\n💰 ${u['money']+win}", parse_mode="Markdown")
-
-@router.message(F.text == "🛒 МАГАЗИН")
+@dp.message(F.text == "🛒 МАГАЗИН")
 async def shop_btn(message: Message):
+    u = db.get_user(message.from_user.id)
+    if not u:
+        return await message.answer("❌ Сначала /start!")
+    
     builder = InlineKeyboardBuilder()
     builder.button(text="🍞 Еда", callback_data="shop_food")
     builder.button(text="💧 Напитки", callback_data="shop_drinks")
     builder.button(text="💊 Медикаменты", callback_data="shop_medical")
-    builder.button(text="🔙 Назад", callback_data="back")
+    builder.button(text="🔙 Закрыть", callback_data="close")
     builder.adjust(2)
     await message.answer("🛒 *Магазин*", reply_markup=builder.as_markup(), parse_mode="Markdown")
 
-@router.callback_query(lambda c: c.data in ["shop_food", "shop_drinks", "shop_medical"])
+@dp.message(F.text == "🏠 ДОМ")
+async def house_btn(message: Message):
+    u = db.get_user(message.from_user.id)
+    if not u:
+        return await message.answer("❌ Сначала /start!")
+    
+    builder = InlineKeyboardBuilder()
+    builder.button(text="🏠 Квартира ($500)", callback_data="house_apartment")
+    builder.button(text="🏡 Дом ($2000)", callback_data="house_house")
+    builder.button(text="🏰 Вилла ($10000)", callback_data="house_villa")
+    builder.button(text="💰 Собрать доход", callback_data="house_collect")
+    builder.button(text="🔙 Закрыть", callback_data="close")
+    builder.adjust(1)
+    await message.answer("🏠 *Недвижимость*", reply_markup=builder.as_markup(), parse_mode="Markdown")
+
+@dp.message(F.text == "🗺 ГОРОД")
+async def city_btn(message: Message):
+    u = db.get_user(message.from_user.id)
+    if not u:
+        return await message.answer("❌ Сначала /start!")
+    
+    cid = u['current_city']
+    city = CITIES.get(cid, CITIES['newark'])
+    
+    builder = InlineKeyboardBuilder()
+    builder.button(text="🏪 Супермаркет", callback_data=f"loc_shop")
+    builder.button(text="🏥 Больница", callback_data=f"loc_hospital")
+    builder.button(text="🔫 Оружейный", callback_data=f"loc_weapons")
+    builder.button(text="🌑 Чёрный рынок", callback_data=f"loc_black")
+    builder.button(text="🍻 Бар", callback_data=f"loc_bar")
+    builder.button(text="🚔 Полиция", callback_data=f"loc_police")
+    builder.button(text="🏠 Домой", callback_data=f"loc_home")
+    builder.button(text="🔙 Закрыть", callback_data="close")
+    builder.adjust(2)
+    
+    await message.answer(f"🏙 *{city.emoji} {city.name}*\nКуда идём?", reply_markup=builder.as_markup(), parse_mode="Markdown")
+
+@dp.message(F.text == "🎒 ИНВЕНТАРЬ")
+async def inv_btn(message: Message):
+    u = db.get_user(message.from_user.id)
+    if not u:
+        return await message.answer("❌ Сначала /start!")
+    
+    items = db.get_inventory(u['user_id'])
+    
+    if not items:
+        return await message.answer("🎒 *Пусто*\nКупи в магазине!", parse_mode="Markdown")
+    
+    builder = InlineKeyboardBuilder()
+    text = "🎒 *Инвентарь:*\n\n"
+    all_items = {**FOOD, **DRINKS, **MEDICAL}
+    
+    for item in items:
+        data = all_items.get(item['item_id'], {})
+        text += f"{data.get('name', item['item_id'])} x{item['quantity']}\n"
+        builder.button(text=f"Использовать {data.get('name', item['item_id'])}", callback_data=f"use_{item['item_id']}")
+    
+    builder.button(text="🔙 Закрыть", callback_data="close")
+    builder.adjust(1)
+    
+    await message.answer(text, reply_markup=builder.as_markup(), parse_mode="Markdown")
+
+@dp.message(F.text == "🏴 БАНДА")
+async def gang_btn(message: Message):
+    u = db.get_user(message.from_user.id)
+    if not u:
+        return await message.answer("❌ Сначала /start!")
+    
+    if u['gang_id']:
+        g = db.get_gang(u['gang_id'])
+        m = db.get_members(u['gang_id'])
+        text = f"🏴 *{g['gang_name']} [{g['gang_tag']}]*\n👥 {len(m)}/{g['max_members']}\n\n"
+        for mb in m:
+            rk = {"leader": "👑", "vice": "🎩", "soldier": "🗡", "recruit": "🔰"}
+            text += f"{rk.get(mb['gang_rank'], '🔰')} {mb['first_name']} Ур.{mb['level']}\n"
+    else:
+        text = "🏴 *Банды*\n\nНет банды.\nСоздать: /gang_create [имя] [тег]\n💰 Стоимость: $1000"
+    
+    builder = InlineKeyboardBuilder()
+    if u['gang_id']:
+        builder.button(text="🚪 Покинуть", callback_data="gang_leave")
+    builder.button(text="🔙 Закрыть", callback_data="close")
+    builder.adjust(1)
+    
+    await message.answer(text, reply_markup=builder.as_markup(), parse_mode="Markdown")
+
+@dp.message(F.text == "🕵️ КРИМИНАЛ")
+async def crime_btn(message: Message):
+    u = db.get_user(message.from_user.id)
+    if not u:
+        return await message.answer("❌ Сначала /start!")
+    
+    builder = InlineKeyboardBuilder()
+    builder.button(text="🔫 Ограбить игрока", callback_data="crime_player")
+    builder.button(text="🏪 Ограбить магазин", callback_data="crime_store")
+    builder.button(text="🚗 Угнать машину", callback_data="crime_car")
+    builder.button(text="🏠 Кража со взломом", callback_data="crime_house")
+    builder.button(text="💰 Продать краденое", callback_data="crime_sell")
+    builder.button(text="🔙 Закрыть", callback_data="close")
+    builder.adjust(1)
+    
+    text = f"🕵️ *Криминал*\n🗡 Оружие: {u['weapon']}\n📊 Преступлений: {u['crimes']}\n💰 Краденого: ${u['stolen']}"
+    await message.answer(text, reply_markup=builder.as_markup(), parse_mode="Markdown")
+
+@dp.message(F.text == "📊 СТАТУС")
+async def status_btn(message: Message):
+    u = db.get_user(message.from_user.id)
+    if not u:
+        return await message.answer("❌ Сначала /start!")
+    
+    city = CITIES.get(u['current_city'], CITIES['newark'])
+    
+    def bar(v):
+        f = int(v/10)
+        return "█"*f + "░"*(10-f)
+    
+    text = (
+        f"📊 *Статус*\n\n"
+        f"👤 {u['first_name']} Ур.{u['level']}\n"
+        f"📍 {city.emoji} {city.name}\n\n"
+        f"🍞 [{bar(u['hunger'])}] {u['hunger']}%\n"
+        f"💧 [{bar(u['thirst'])}] {u['thirst']}%\n"
+        f"❤️ [{bar(u['health'])}] {u['health']}%\n"
+        f"😴 [{bar(u['sleep'])}] {u['sleep']}%\n"
+        f"😊 [{bar(u['mood'])}] {u['mood']}%\n\n"
+        f"💰 ${u['money']} ⚡ {u['energy']}\n"
+        f"🗡 {u['weapon']} 🏠 {u['house_id'] or 'Нет'}"
+    )
+    await message.answer(text, parse_mode="Markdown")
+
+@dp.message(F.text == "🗺 КАРТА")
+async def map_btn(message: Message):
+    u = db.get_user(message.from_user.id)
+    if not u:
+        return await message.answer("❌ Сначала /start!")
+    
+    cur = CITIES.get(u['current_city'], CITIES['newark'])
+    
+    builder = InlineKeyboardBuilder()
+    text = f"🗺 *Карта*\n📍 {cur.emoji} {cur.name}\n\n"
+    
+    for cid, city in CITIES.items():
+        if cid != u['current_city']:
+            if u['level'] >= city.min_level:
+                text += f"🟢 {city.emoji} {city.name} — 🚕 ${city.taxi_price}\n"
+                builder.button(text=f"{city.emoji} {city.name}", callback_data=f"travel_{cid}")
+            else:
+                text += f"🔒 {city.emoji} {city.name} — Ур.{city.min_level}\n"
+    
+    builder.button(text="🔙 Закрыть", callback_data="close")
+    builder.adjust(1)
+    
+    await message.answer(text, reply_markup=builder.as_markup(), parse_mode="Markdown")
+
+@dp.message(F.text == "🏆 ТОП")
+async def top_btn(message: Message):
+    db.cursor.execute("SELECT first_name, money, level, current_city FROM users ORDER BY money DESC LIMIT 10")
+    top = db.cursor.fetchall()
+    
+    text = "🏆 *Топ-10*\n\n"
+    for i, p in enumerate(top, 1):
+        medals = {1: "🥇", 2: "🥈", 3: "🥉"}
+        med = medals.get(i, f"{i}.")
+        city = CITIES.get(p['current_city'], CITIES['newark'])
+        text += f"{med} {p['first_name']} [{city.emoji}] — ${p['money']}\n"
+    
+    db.cursor.execute("SELECT COUNT(*)+1 FROM users WHERE money>(SELECT money FROM users WHERE user_id=?)", (message.from_user.id,))
+    rank = db.cursor.fetchone()[0]
+    text += f"\n📊 Ты: #{rank}"
+    
+    await message.answer(text, parse_mode="Markdown")
+
+@dp.message(F.text == "❓ ПОМОЩЬ")
+async def help_btn(message: Message):
+    await help_cmd(message)
+
+# ==================== CALLBACK ОБРАБОТЧИКИ ====================
+@dp.callback_query(lambda c: c.data == "close")
+async def close_msg(callback: CallbackQuery):
+    await callback.message.delete()
+
+@dp.callback_query(lambda c: c.data.startswith("work_"))
+async def do_work(callback: CallbackQuery):
+    u = db.get_user(callback.from_user.id)
+    pay = int(callback.data.split("_")[1])
+    
+    if u['energy'] < 20:
+        return await callback.answer("❌ Мало энергии!", show_alert=True)
+    
+    if u['last_work']:
+        last = datetime.fromisoformat(u['last_work'])
+        if (datetime.now() - last).seconds < 900:
+            return await callback.answer("⏳ Подожди 15 минут!", show_alert=True)
+    
+    city = CITIES.get(u['current_city'], CITIES['newark'])
+    total = int(pay * city.income_mult)
+    
+    db.add_money(u['user_id'], total)
+    db.update(u['user_id'], last_work=datetime.now().isoformat(), energy=u['energy']-20, xp=u['xp']+10)
+    
+    await callback.message.edit_text(f"✅ *Работа выполнена!*\n💰 +${total}", parse_mode="Markdown")
+
+@dp.callback_query(lambda c: c.data in ["casino_roulette", "casino_slots"])
+async def casino_games(callback: CallbackQuery):
+    u = db.get_user(callback.from_user.id)
+    
+    if callback.data == "casino_roulette":
+        if u['money'] < 50: return await callback.answer("❌ $50 нужно!", show_alert=True)
+        win = random.random() < 0.4
+        w = random.choice([100, 200, 500]) if win else -50
+        db.update(u['user_id'], money=u['money']+w)
+        await callback.message.edit_text(f"🎲 {'Выигрыш' if win else 'Проигрыш'}: ${abs(w)}\n💰 ${u['money']+w}", parse_mode="Markdown")
+    else:
+        if u['money'] < 10: return await callback.answer("❌ $10 нужно!", show_alert=True)
+        s = ["🍒","🍋","🍊","⭐","💎","7️⃣"]
+        r = [random.choice(s) for _ in range(3)]
+        if r[0]==r[1]==r[2]: win, txt = 100, "ДЖЕКПОТ! +$100"
+        elif len(set(r))==2: win, txt = 20, "Повезло! +$20"
+        else: win, txt = -10, "Мимо! -$10"
+        db.update(u['user_id'], money=u['money']+win)
+        await callback.message.edit_text(f"🎰 [{'|'.join(r)}]\n{txt}\n💰 ${u['money']+win}", parse_mode="Markdown")
+
+@dp.callback_query(lambda c: c.data in ["shop_food", "shop_drinks", "shop_medical"])
 async def shop_cat(callback: CallbackQuery):
     cat = callback.data.split("_")[1]
     items = {"food": FOOD, "drinks": DRINKS, "medical": MEDICAL}[cat]
@@ -357,49 +640,38 @@ async def shop_cat(callback: CallbackQuery):
     for iid, item in items.items():
         text += f"{item['name']} — ${item['price']}\n"
         builder.button(text=f"{item['name']} (${item['price']})", callback_data=f"buy_{iid}")
-    builder.button(text="🔙 Назад", callback_data="back_to_shop")
+    builder.button(text="🔙 Назад", callback_data="back_shop")
     builder.adjust(1)
     
     await callback.message.edit_text(text, reply_markup=builder.as_markup(), parse_mode="Markdown")
 
-@router.callback_query(lambda c: c.data.startswith("buy_"))
+@dp.callback_query(lambda c: c.data.startswith("buy_"))
 async def buy_item(callback: CallbackQuery):
     item_id = callback.data.replace("buy_", "")
-    user = db.get_user(callback.from_user.id)
+    u = db.get_user(callback.from_user.id)
     
     item = FOOD.get(item_id) or DRINKS.get(item_id) or MEDICAL.get(item_id)
     if not item: return await callback.answer("❌ Нет товара!", show_alert=True)
     
-    if user['money'] < item['price']: return await callback.answer(f"❌ ${item['price']} нужно!", show_alert=True)
+    if u['money'] < item['price']: return await callback.answer(f"❌ ${item['price']} нужно!", show_alert=True)
     
-    db.add_money(user['user_id'], -item['price'])
+    db.add_money(u['user_id'], -item['price'])
     itype = "food" if item_id in FOOD else "drink" if item_id in DRINKS else "medical"
-    db.add_item(user['user_id'], item_id, itype)
+    db.add_item(u['user_id'], item_id, itype)
     
     await callback.answer(f"✅ {item['name']} куплен!", show_alert=True)
 
-@router.callback_query(lambda c: c.data == "back_to_shop")
+@dp.callback_query(lambda c: c.data == "back_shop")
 async def back_shop(callback: CallbackQuery):
     builder = InlineKeyboardBuilder()
     builder.button(text="🍞 Еда", callback_data="shop_food")
     builder.button(text="💧 Напитки", callback_data="shop_drinks")
     builder.button(text="💊 Медикаменты", callback_data="shop_medical")
-    builder.button(text="🔙 Назад", callback_data="back")
+    builder.button(text="🔙 Закрыть", callback_data="close")
     builder.adjust(2)
     await callback.message.edit_text("🛒 *Магазин*", reply_markup=builder.as_markup(), parse_mode="Markdown")
 
-@router.message(F.text == "🏠 ДОМ")
-async def house_btn(message: Message):
-    builder = InlineKeyboardBuilder()
-    builder.button(text="🏠 Квартира ($500)", callback_data="house_apartment")
-    builder.button(text="🏡 Дом ($2000)", callback_data="house_house")
-    builder.button(text="🏰 Вилла ($10000)", callback_data="house_villa")
-    builder.button(text="💰 Собрать доход", callback_data="house_collect")
-    builder.button(text="🔙 Назад", callback_data="back")
-    builder.adjust(1)
-    await message.answer("🏠 *Недвижимость*", reply_markup=builder.as_markup(), parse_mode="Markdown")
-
-@router.callback_query(lambda c: c.data.startswith("house_"))
+@dp.callback_query(lambda c: c.data.startswith("house_"))
 async def house_act(callback: CallbackQuery):
     act = callback.data.replace("house_", "")
     u = db.get_user(callback.from_user.id)
@@ -416,43 +688,23 @@ async def house_act(callback: CallbackQuery):
     db.update(u['user_id'], house_id=act)
     await callback.answer("✅ Куплен!", show_alert=True)
 
-@router.message(F.text == "🗺 ГОРОД")
-async def city_btn(message: Message):
-    u = db.get_user(message.from_user.id)
-    cid = u['current_city']
-    city = CITIES.get(cid, CITIES['newark'])
-    
-    builder = InlineKeyboardBuilder()
-    builder.button(text="🏪 Супермаркет", callback_data=f"loc_shop_{cid}")
-    builder.button(text="🏥 Больница", callback_data=f"loc_hospital_{cid}")
-    builder.button(text="🔫 Оружейный", callback_data=f"loc_weapons_{cid}")
-    builder.button(text="🌑 Чёрный рынок", callback_data=f"loc_black_{cid}")
-    builder.button(text="🍻 Бар", callback_data=f"loc_bar_{cid}")
-    builder.button(text="🚔 Полиция", callback_data=f"loc_police_{cid}")
-    builder.button(text="🏠 Домой", callback_data=f"loc_home_{cid}")
-    builder.button(text="🔙 Назад", callback_data="back")
-    builder.adjust(2)
-    
-    await message.answer(f"🏙 *{city.emoji} {city.name}*\nКуда идём?", reply_markup=builder.as_markup(), parse_mode="Markdown")
-
-@router.callback_query(lambda c: c.data.startswith("loc_"))
+@dp.callback_query(lambda c: c.data.startswith("loc_"))
 async def location(callback: CallbackQuery):
-    parts = callback.data.split("_")
-    loc = parts[1]
-    cid = parts[2]
+    loc = callback.data.replace("loc_", "")
     u = db.get_user(callback.from_user.id)
+    cid = u['current_city']
     
     if loc == "shop":
         await back_shop(callback)
         return
     
     actions = {
-        "hospital": ("🏥 Больница", [("💊 Лечить ($500)", f"heal_{cid}")]),
-        "weapons": ("🔫 Оружейный", [(f"{w['name']} (${w['price']})", f"buyw_{wid}_{cid}") for wid, w in WEAPONS.items() if not w.get('illegal')]),
-        "black": ("🌑 Чёрный рынок", [(f"{w['name']} (${int(w['price']*0.6)})", f"buyw_{wid}_{cid}") for wid, w in WEAPONS.items() if w.get('illegal')]),
-        "bar": ("🍻 Бар", [("🍺 Выпить ($20)", f"bar_drink_{cid}"), ("👊 Драка", f"bar_fight_{cid}")]),
-        "police": ("🚔 Полиция", [("💰 Взятка ($100)", f"bribe_{cid}")]),
-        "home": ("🏠 Дом", [("😴 Спать", f"sleep_{cid}")])
+        "hospital": ("🏥 Больница", [("💊 Лечить ($500)", f"heal")]),
+        "weapons": ("🔫 Оружейный", [(f"{w['name']} (${w['price']})", f"buyw_{wid}") for wid, w in WEAPONS.items() if not w.get('illegal')]),
+        "black": ("🌑 Чёрный рынок", [(f"{w['name']} (${int(w['price']*0.6)})", f"buyw_{wid}") for wid, w in WEAPONS.items() if w.get('illegal')]),
+        "bar": ("🍻 Бар", [("🍺 Выпить ($20)", "bar_drink"), ("👊 Драка", "bar_fight")]),
+        "police": ("🚔 Полиция", [("💰 Взятка ($100)", "bribe")]),
+        "home": ("🏠 Дом", [("😴 Спать", "sleep")])
     }
     
     if loc not in actions:
@@ -465,12 +717,12 @@ async def location(callback: CallbackQuery):
     builder = InlineKeyboardBuilder()
     for txt, cb in btns:
         builder.button(text=txt, callback_data=cb)
-    builder.button(text="🔙 Назад", callback_data=f"back_city_{cid}")
+    builder.button(text="🔙 Назад", callback_data="back_city")
     builder.adjust(1)
     
     await callback.message.edit_text(f"{title}", reply_markup=builder.as_markup(), parse_mode="Markdown")
 
-@router.callback_query(lambda c: c.data.startswith("heal_"))
+@dp.callback_query(lambda c: c.data == "heal")
 async def heal(callback: CallbackQuery):
     u = db.get_user(callback.from_user.id)
     if u['money'] < 500: return await callback.answer("❌ $500 нужно!", show_alert=True)
@@ -478,16 +730,14 @@ async def heal(callback: CallbackQuery):
     db.update(u['user_id'], health=100)
     await callback.answer("✅ Здоровье 100%!", show_alert=True)
 
-@router.callback_query(lambda c: c.data.startswith("buyw_"))
+@dp.callback_query(lambda c: c.data.startswith("buyw_"))
 async def buy_weapon(callback: CallbackQuery):
-    parts = callback.data.split("_")
-    wid = parts[1]
-    cid = parts[2]
+    wid = callback.data.replace("buyw_", "")
     u = db.get_user(callback.from_user.id)
     w = WEAPONS.get(wid)
     if not w: return await callback.answer("❌ Нет!", show_alert=True)
     
-    city = CITIES.get(cid, CITIES['newark'])
+    city = CITIES.get(u['current_city'], CITIES['newark'])
     price = int(w['price'] * city.income_mult * (0.6 if w.get('illegal') else 0.8))
     
     if u['money'] < price: return await callback.answer(f"❌ ${price} нужно!", show_alert=True)
@@ -495,77 +745,50 @@ async def buy_weapon(callback: CallbackQuery):
     db.update(u['user_id'], weapon=wid)
     await callback.answer(f"✅ {w['name']} куплен!", show_alert=True)
 
-@router.callback_query(lambda c: c.data.startswith("bar_drink_"))
-async def bar_drink(callback: CallbackQuery):
+@dp.callback_query(lambda c: c.data in ["bar_drink", "bar_fight", "bribe", "sleep"])
+async def quick_actions(callback: CallbackQuery):
     u = db.get_user(callback.from_user.id)
-    if u['money'] < 20: return await callback.answer("❌ $20 нужно!", show_alert=True)
-    db.add_money(u['user_id'], -20)
-    db.update(u['user_id'], mood=min(100, u['mood']+20), thirst=min(100, u['thirst']+30))
-    await callback.answer("🍺 Выпито! +Настроение", show_alert=True)
+    act = callback.data
+    
+    if act == "bar_drink":
+        if u['money'] < 20: return await callback.answer("❌ $20 нужно!", show_alert=True)
+        db.add_money(u['user_id'], -20)
+        db.update(u['user_id'], mood=min(100, u['mood']+20), thirst=min(100, u['thirst']+30))
+        await callback.answer("🍺 Выпито!", show_alert=True)
+    elif act == "bar_fight":
+        if random.random() < 0.5:
+            db.update(u['user_id'], xp=u['xp']+15, reputation=u['reputation']+5)
+            await callback.answer("👊 Победа! +15 XP", show_alert=True)
+        else:
+            db.update(u['user_id'], health=max(10, u['health']-20))
+            await callback.answer("👊 Поражение! -20 HP", show_alert=True)
+    elif act == "bribe":
+        if u['money'] < 100: return await callback.answer("❌ $100 нужно!", show_alert=True)
+        db.add_money(u['user_id'], -100)
+        await callback.answer("🤝 Договорились!", show_alert=True)
+    elif act == "sleep":
+        db.update(u['user_id'], sleep=100, energy=100)
+        await callback.answer("😴 +Энергия +Сон", show_alert=True)
 
-@router.callback_query(lambda c: c.data.startswith("bar_fight_"))
-async def bar_fight(callback: CallbackQuery):
-    u = db.get_user(callback.from_user.id)
-    if random.random() < 0.5:
-        db.update(u['user_id'], xp=u['xp']+15, reputation=u['reputation']+5)
-        await callback.answer("👊 Победа! +15 XP", show_alert=True)
-    else:
-        db.update(u['user_id'], health=max(10, u['health']-20))
-        await callback.answer("👊 Поражение! -20 HP", show_alert=True)
-
-@router.callback_query(lambda c: c.data.startswith("bribe_"))
-async def bribe(callback: CallbackQuery):
-    u = db.get_user(callback.from_user.id)
-    if u['money'] < 100: return await callback.answer("❌ $100 нужно!", show_alert=True)
-    db.add_money(u['user_id'], -100)
-    await callback.answer("🤝 Договорились!", show_alert=True)
-
-@router.callback_query(lambda c: c.data.startswith("sleep_"))
-async def sleep(callback: CallbackQuery):
-    db.update(callback.from_user.id, sleep=100, energy=100)
-    await callback.answer("😴 Поспал! +Энергия +Сон", show_alert=True)
-
-@router.callback_query(lambda c: c.data.startswith("back_city_"))
+@dp.callback_query(lambda c: c.data == "back_city")
 async def back_city(callback: CallbackQuery):
-    cid = callback.data.split("_")[2]
-    city = CITIES.get(cid, CITIES['newark'])
+    u = db.get_user(callback.from_user.id)
+    city = CITIES.get(u['current_city'], CITIES['newark'])
     
     builder = InlineKeyboardBuilder()
-    builder.button(text="🏪 Супермаркет", callback_data=f"loc_shop_{cid}")
-    builder.button(text="🏥 Больница", callback_data=f"loc_hospital_{cid}")
-    builder.button(text="🔫 Оружейный", callback_data=f"loc_weapons_{cid}")
-    builder.button(text="🌑 Чёрный рынок", callback_data=f"loc_black_{cid}")
-    builder.button(text="🍻 Бар", callback_data=f"loc_bar_{cid}")
-    builder.button(text="🚔 Полиция", callback_data=f"loc_police_{cid}")
-    builder.button(text="🏠 Домой", callback_data=f"loc_home_{cid}")
-    builder.button(text="🔙 Назад", callback_data="back")
+    builder.button(text="🏪 Супермаркет", callback_data="loc_shop")
+    builder.button(text="🏥 Больница", callback_data="loc_hospital")
+    builder.button(text="🔫 Оружейный", callback_data="loc_weapons")
+    builder.button(text="🌑 Чёрный рынок", callback_data="loc_black")
+    builder.button(text="🍻 Бар", callback_data="loc_bar")
+    builder.button(text="🚔 Полиция", callback_data="loc_police")
+    builder.button(text="🏠 Домой", callback_data="loc_home")
+    builder.button(text="🔙 Закрыть", callback_data="close")
     builder.adjust(2)
     
     await callback.message.edit_text(f"🏙 *{city.emoji} {city.name}*", reply_markup=builder.as_markup(), parse_mode="Markdown")
 
-@router.message(F.text == "🎒 ИНВЕНТАРЬ")
-async def inv_btn(message: Message):
-    u = db.get_user(message.from_user.id)
-    items = db.get_inventory(u['user_id'])
-    
-    if not items:
-        return await message.answer("🎒 *Пусто*\nКупи в магазине!", parse_mode="Markdown")
-    
-    builder = InlineKeyboardBuilder()
-    text = "🎒 *Инвентарь:*\n\n"
-    all_items = {**FOOD, **DRINKS, **MEDICAL}
-    
-    for item in items:
-        data = all_items.get(item['item_id'], {})
-        text += f"{data.get('name', item['item_id'])} x{item['quantity']}\n"
-        builder.button(text=f"Использовать {data.get('name', item['item_id'])}", callback_data=f"use_{item['item_id']}")
-    
-    builder.button(text="🔙 Назад", callback_data="back")
-    builder.adjust(1)
-    
-    await message.answer(text, reply_markup=builder.as_markup(), parse_mode="Markdown")
-
-@router.callback_query(lambda c: c.data.startswith("use_"))
+@dp.callback_query(lambda c: c.data.startswith("use_"))
 async def use_item(callback: CallbackQuery):
     item_id = callback.data.replace("use_", "")
     u = db.get_user(callback.from_user.id)
@@ -586,104 +809,7 @@ async def use_item(callback: CallbackQuery):
         db.update(u['user_id'], health=min(100, u['health']+MEDICAL[item_id]['health']))
         await callback.answer(f"💊 +{MEDICAL[item_id]['health']} HP", show_alert=True)
 
-@router.message(F.text == "🏴 БАНДА")
-async def gang_btn(message: Message):
-    u = db.get_user(message.from_user.id)
-    
-    if u['gang_id']:
-        g = db.get_gang(u['gang_id'])
-        m = db.get_members(u['gang_id'])
-        text = f"🏴 *{g['gang_name']} [{g['gang_tag']}]*\n👥 {len(m)}/{g['max_members']}\n\n"
-        for mb in m:
-            rk = {"leader": "👑", "vice": "🎩", "soldier": "🗡", "recruit": "🔰"}
-            text += f"{rk.get(mb['gang_rank'], '🔰')} {mb['first_name']} Ур.{mb['level']}\n"
-    else:
-        text = "🏴 *Банды*\n\nНет банды.\nСоздать: /gang_create [имя] [тег]\n💰 Стоимость: $1000"
-    
-    builder = InlineKeyboardBuilder()
-    if u['gang_id']:
-        builder.button(text="🚪 Покинуть", callback_data="gang_leave")
-    builder.button(text="🔙 Назад", callback_data="back")
-    builder.adjust(1)
-    
-    await message.answer(text, reply_markup=builder.as_markup(), parse_mode="Markdown")
-
-@router.message(Command("gang_create"))
-async def gang_create(message: Message):
-    args = message.text.split()
-    if len(args) < 2: return await message.answer("❌ /gang_create [имя] [тег]")
-    
-    u = db.get_user(message.from_user.id)
-    if u['money'] < 1000: return await message.answer("❌ $1000 нужно!")
-    if u['gang_id']: return await message.answer("❌ Ты уже в банде!")
-    
-    name = args[1]
-    tag = args[2] if len(args) > 2 else name[:4].upper()
-    
-    gid = db.create_gang(name, tag, message.from_user.id)
-    if gid:
-        db.add_money(u['user_id'], -1000)
-        await message.answer(f"✅ Банда *{name}* [{tag}] создана!", parse_mode="Markdown")
-    else:
-        await message.answer("❌ Имя или тег заняты!")
-
-@router.callback_query(lambda c: c.data == "gang_leave")
-async def gang_leave(callback: CallbackQuery):
-    if db.leave_gang(callback.from_user.id):
-        await callback.answer("🚪 Покинул банду!", show_alert=True)
-        await callback.message.edit_text("✅ Ты вне банды.")
-    else:
-        await callback.answer("❌ Ошибка!", show_alert=True)
-
-@router.message(F.text == "🕵️ КРИМИНАЛ")
-async def crime_btn(message: Message):
-    u = db.get_user(message.from_user.id)
-    
-    builder = InlineKeyboardBuilder()
-    builder.button(text="🔫 Ограбить игрока", callback_data="crime_player")
-    builder.button(text="🏪 Ограбить магазин", callback_data="crime_store")
-    builder.button(text="🚗 Угнать машину", callback_data="crime_car")
-    builder.button(text="🏠 Кража со взломом", callback_data="crime_house")
-    builder.button(text="💰 Продать краденое", callback_data="crime_sell")
-    builder.button(text="🔙 Назад", callback_data="back")
-    builder.adjust(1)
-    
-    text = f"🕵️ *Криминал*\n🗡 Оружие: {u['weapon']}\n📊 Преступлений: {u['crimes']}\n💰 Краденого: ${u['stolen']}"
-    await message.answer(text, reply_markup=builder.as_markup(), parse_mode="Markdown")
-
-@router.message(Command("rob"))
-async def rob_player(message: Message):
-    args = message.text.split()
-    if len(args) < 2: return await message.answer("❌ /rob [ID игрока]")
-    
-    try:
-        vid = int(args[1])
-    except:
-        return await message.answer("❌ Неверный ID!")
-    
-    if vid == message.from_user.id: return await message.answer("❌ Нельзя себя!")
-    
-    victim = db.get_user(vid)
-    if not victim: return await message.answer("❌ Игрок не найден!")
-    if victim['money'] < 50: return await message.answer("❌ У жертвы < $50!")
-    
-    u = db.get_user(message.from_user.id)
-    wd = WEAPONS.get(u['weapon'], {"damage": 5})['damage']
-    vd = WEAPONS.get(victim['weapon'], {"damage": 5})['damage']
-    chance = max(0.1, min(0.9, 0.3 + wd*0.01 - vd*0.005))
-    
-    if random.random() < chance:
-        stolen = int(victim['money'] * random.uniform(0.1, 0.3))
-        db.add_money(vid, -stolen)
-        db.add_money(u['user_id'], stolen)
-        db.update(u['user_id'], crimes=u['crimes']+1, stolen=u['stolen']+stolen)
-        await message.answer(f"✅ +${stolen}!")
-    else:
-        fine = random.randint(50, 200)
-        db.add_money(u['user_id'], -fine)
-        await message.answer(f"🚔 Штраф: ${fine}")
-
-@router.callback_query(lambda c: c.data in ["crime_store", "crime_car", "crime_house"])
+@dp.callback_query(lambda c: c.data in ["crime_store", "crime_car", "crime_house"])
 async def crimes(callback: CallbackQuery):
     u = db.get_user(callback.from_user.id)
     ct = callback.data
@@ -704,7 +830,7 @@ async def crimes(callback: CallbackQuery):
         db.add_money(u['user_id'], -fine)
         await callback.answer(f"🚔 Штраф: ${fine}", show_alert=True)
 
-@router.callback_query(lambda c: c.data == "crime_sell")
+@dp.callback_query(lambda c: c.data == "crime_sell")
 async def sell_stolen(callback: CallbackQuery):
     u = db.get_user(callback.from_user.id)
     if u['stolen'] < 100: return await callback.answer("❌ Мало краденого!", show_alert=True)
@@ -713,51 +839,19 @@ async def sell_stolen(callback: CallbackQuery):
     db.update(u['user_id'], stolen=0)
     await callback.answer(f"💰 +${amount}!", show_alert=True)
 
-@router.message(F.text == "📊 СТАТУС")
-async def status_btn(message: Message):
-    u = db.get_user(message.from_user.id)
-    city = CITIES.get(u['current_city'], CITIES['newark'])
-    
-    def bar(v):
-        f = int(v/10)
-        return "█"*f + "░"*(10-f)
-    
-    text = (
-        f"📊 *Статус*\n\n"
-        f"👤 {u['first_name']} Ур.{u['level']}\n"
-        f"📍 {city.emoji} {city.name}\n\n"
-        f"🍞 [{bar(u['hunger'])}] {u['hunger']}%\n"
-        f"💧 [{bar(u['thirst'])}] {u['thirst']}%\n"
-        f"❤️ [{bar(u['health'])}] {u['health']}%\n"
-        f"😴 [{bar(u['sleep'])}] {u['sleep']}%\n"
-        f"😊 [{bar(u['mood'])}] {u['mood']}%\n\n"
-        f"💰 ${u['money']} ⚡ {u['energy']}\n"
-        f"🗡 {u['weapon']} 🏠 {u['house_id'] or 'Нет'}"
-    )
-    await message.answer(text, reply_markup=back_button(), parse_mode="Markdown")
+@dp.callback_query(lambda c: c.data == "crime_player")
+async def crime_player_info(callback: CallbackQuery):
+    await callback.message.edit_text("🔫 Используй команду:\n/rob [ID игрока]", parse_mode="Markdown")
 
-@router.message(F.text == "🗺 КАРТА")
-async def map_btn(message: Message):
-    u = db.get_user(message.from_user.id)
-    cur = CITIES.get(u['current_city'], CITIES['newark'])
-    
-    builder = InlineKeyboardBuilder()
-    text = f"🗺 *Карта*\n📍 {cur.emoji} {cur.name}\n\n"
-    
-    for cid, city in CITIES.items():
-        if cid != u['current_city']:
-            if u['level'] >= city.min_level:
-                text += f"🟢 {city.emoji} {city.name} — 🚕 ${city.taxi_price}\n"
-                builder.button(text=f"{city.emoji} {city.name}", callback_data=f"travel_{cid}")
-            else:
-                text += f"🔒 {city.emoji} {city.name} — Ур.{city.min_level}\n"
-    
-    builder.button(text="🔙 Назад", callback_data="back")
-    builder.adjust(1)
-    
-    await message.answer(text, reply_markup=builder.as_markup(), parse_mode="Markdown")
+@dp.callback_query(lambda c: c.data == "gang_leave")
+async def gang_leave(callback: CallbackQuery):
+    if db.leave_gang(callback.from_user.id):
+        await callback.answer("🚪 Покинул банду!", show_alert=True)
+        await callback.message.edit_text("✅ Ты вне банды.")
+    else:
+        await callback.answer("❌ Ошибка!", show_alert=True)
 
-@router.callback_query(lambda c: c.data.startswith("travel_"))
+@dp.callback_query(lambda c: c.data.startswith("travel_"))
 async def travel(callback: CallbackQuery):
     cid = callback.data.replace("travel_", "")
     u = db.get_user(callback.from_user.id)
@@ -772,86 +866,20 @@ async def travel(callback: CallbackQuery):
     
     await callback.message.edit_text(f"🚕 *{city.emoji} {city.name}!*\n{city.description}\n💰 -${city.taxi_price}", parse_mode="Markdown")
 
-@router.message(F.text == "🏆 ТОП")
-async def top_btn(message: Message):
-    db.cursor.execute("SELECT first_name, money, level, current_city FROM users ORDER BY money DESC LIMIT 10")
-    top = db.cursor.fetchall()
-    
-    text = "🏆 *Топ-10*\n\n"
-    for i, p in enumerate(top, 1):
-        medals = {1: "🥇", 2: "🥈", 3: "🥉"}
-        med = medals.get(i, f"{i}.")
-        city = CITIES.get(p['current_city'], CITIES['newark'])
-        text += f"{med} {p['first_name']} [{city.emoji}] — ${p['money']}\n"
-    
-    db.cursor.execute("SELECT COUNT(*)+1 FROM users WHERE money>(SELECT money FROM users WHERE user_id=?)", (message.from_user.id,))
-    rank = db.cursor.fetchone()[0]
-    text += f"\n📊 Ты: #{rank}"
-    
-    await message.answer(text, parse_mode="Markdown")
-
-@router.message(F.text == "❓ ПОМОЩЬ")
-@router.message(Command("help"))
-async def help_cmd(message: Message):
-    await message.answer(
-        "📚 *Помощь*\n\n"
-        "💼 РАБОТА — заработок\n"
-        "🎰 КАЗИНО — игры\n"
-        "🛒 МАГАЗИН — товары\n"
-        "🏠 ДОМ — недвижимость\n"
-        "🗺 ГОРОД — локации\n"
-        "🎒 ИНВЕНТАРЬ — вещи\n"
-        "🏴 БАНДА — банды\n"
-        "🕵️ КРИМИНАЛ — преступления\n"
-        "📊 СТАТУС — показатели\n"
-        "🗺 КАРТА — города\n"
-        "🏆 ТОП — рейтинг\n\n"
-        "/profile /gang_create /rob /ref",
-        parse_mode="Markdown"
-    )
-
-@router.message(Command("profile"))
-async def profile(message: Message):
-    u = db.get_user(message.from_user.id)
-    if not u: return await message.answer("❌ /start сначала!")
-    city = CITIES.get(u['current_city'], CITIES['newark'])
-    g = db.get_gang(u['gang_id']) if u['gang_id'] else None
-    
-    await message.answer(
-        f"👤 *{u['first_name']}*\n"
-        f"📍 {city.emoji} {city.name}\n"
-        f"💰 ${u['money']} ⭐ Ур.{u['level']}\n"
-        f"🏴 {g['gang_name'] if g else 'Нет'}\n"
-        f"🗡 {u['weapon']} 🕵️ {u['crimes']} прест.",
-        parse_mode="Markdown"
-    )
-
-@router.message(Command("ref"))
-async def ref_cmd(message: Message):
-    u = db.get_user(message.from_user.id)
-    if not u: return await message.answer("❌ /start сначала!")
-    bi = await bot.get_me()
-    link = f"https://t.me/{bi.username}?start={u['referral_code']}"
-    await message.answer(f"👥 *Рефералы*\n🔗 `{link}`\n📊 {u['total_referrals']} чел.", parse_mode="Markdown")
-
-@router.callback_query(lambda c: c.data == "back")
-async def back(callback: CallbackQuery):
-    await callback.message.edit_text("📋 *Меню*\nИспользуй кнопки внизу!", parse_mode="Markdown")
-
 # ==================== ЗАПУСК ====================
 async def main():
     logging.basicConfig(level=logging.INFO)
     
     await bot.set_my_commands([
-        BotCommand(command="start", description="Начать"),
+        BotCommand(command="start", description="Начать игру"),
         BotCommand(command="help", description="Помощь"),
         BotCommand(command="profile", description="Профиль"),
         BotCommand(command="gang_create", description="Создать банду"),
-        BotCommand(command="rob", description="Ограбить"),
+        BotCommand(command="rob", description="Ограбить игрока"),
         BotCommand(command="ref", description="Рефералы"),
     ])
     
-    print("✅ Бот запущен!")
+    print("✅ Бот запущен! Все кнопки работают.")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
